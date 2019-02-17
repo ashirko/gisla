@@ -38,10 +38,7 @@ new_transaction() ->
 %% @doc Given a valid name (atom, binary string or string), and a
 %% ordered list of `#step{}' records, return a new `#transaction{}'.
 -spec new_transaction( Name :: gisla_name(), Steps :: steps() ) -> #transaction{}.
-new_transaction(Name, Steps) when is_list(Steps)
-                          andalso ( is_atom(Name)
-                          orelse is_binary(Name)
-                          orelse is_list(Name) ) ->
+new_transaction(Name, Steps) -> %% validity of name is checked in is_valid_name/1; validity of steps is checked in is_valid_steps/1
     true = is_valid_name(Name),
     true = validate_steps(Steps),
     #transaction{
@@ -79,12 +76,16 @@ new_step(Name, F = #operation{}, R = #operation{}) ->
     true = validate_operation_fun(R),
     #step{ name = Name, forward = F, rollback = R };
 new_step(Name, F, R) ->
-    new_step(Name, new_operation(F), new_operation(R)).
+    true = is_valid_name(Name),
+    Forward = new_operation(F), %% no need to validate functions two times
+    Rollback = new_operation(R),
+    #step{ name = Name, forward = Forward, rollback = Rollback }.
 
 %% @doc Add the given step to a transaction's steps.
 -spec add_step( Step :: #step{}, T :: #transaction{} ) -> #transaction{}.
-add_step(E = #step{}, T = #transaction{ steps = P }) ->
+add_step(E = #step{ name = Name }, T = #transaction{ steps = P }) ->
     true = validate_step(E),
+    false = lists:keyfind(Name, #step.name, P), %% step name must be unique
     T#transaction{ steps = P ++ [E] }.
 
 %% @doc Remove the step having the given name from a transaction's steps.
@@ -116,7 +117,7 @@ new_operation(Fun = {_F, _A}) ->
 %% @doc Wrap the given function and use the given timeout value
 %% instead of the default value. The timeout value must be
 %% greater than zero (0).
--spec new_operation( Function :: operation_fun(), Timeout :: pos_integer() ) -> #operation{}.
+-spec new_operation( Function :: function() | operation_fun(), Timeout :: pos_integer() ) -> #operation{}.
 new_operation(F, Timeout) when is_integer(Timeout) andalso Timeout > 0 ->
    true = validate_function(F),
    #operation{ f = F, timeout = Timeout }.
@@ -200,46 +201,47 @@ do_step(Name, Func, State) ->
     {F, Timeout} = make_closure(Func, self(), State),
     {Pid, Mref} = spawn_monitor(fun() -> F() end),
     ?log(info, "Started pid ~p to execute step ~p", [Pid, Name]),
-    handle_loop_return(loop(Mref, Pid, Timeout, State, false), Func).
+    TRef = erlang:start_timer(Timeout, self(), timeout),
+    handle_loop_return(loop(Mref, Pid, TRef, State, false), Func).
 
 handle_loop_return({ok, Reason, State}, Func) ->
     {ok, Func#operation{ state = complete, result = success, reason = Reason }, State};
 handle_loop_return({failed, Reason, State}, Func) ->
     {failed, Func#operation{ state = complete, result = failed, reason = Reason }, State}.
 
-loop(Mref, Pid, Timeout, State, NormalExitRcvd) ->
+loop(Mref, Pid, TRef, State, NormalExitRcvd) ->
     receive
         race_conditions_are_bad_mmmkay ->
-            ?log(debug, "Normal exit received, with no failure messages out of order."),
+            ?log(debug, "Normal exit received, with no failure messages out of  ."),
             {ok, normal, State};
         {complete, NewState} ->
             ?log(info, "Step sent complete..."),
             demonitor(Mref, [flush]), %% prevent us from getting any spurious failures and clean out our mailbox
             self() ! race_conditions_are_bad_mmmkay,
-            loop(Mref, Pid, Timeout, NewState, true);
+            loop(Mref, Pid, TRef, NewState, true);
         {checkpoint, NewState} ->
             ?log(debug, "Got a checkpoint state"),
-            loop(Mref, Pid, Timeout, NewState, NormalExitRcvd);
+            loop(Mref, Pid, TRef, NewState, NormalExitRcvd);
         {'DOWN', Mref, process, Pid, normal} ->
             %% so we exited fine but didn't get a results reply yet... let's loop around maybe it will be
             %% the next message in our mailbox.
-            loop(Mref, Pid, Timeout, State, true);
+            loop(Mref, Pid, TRef, State, true);
         {'DOWN', Mref, process, Pid, Reason} ->
             %% We crashed for some reason
             ?log(error, "Pid ~p failed because ~p", [Pid, Reason]),
             {failed, Reason, State};
+        {timeout, TRef, _} ->
+            case NormalExitRcvd of
+                false ->
+                    ?log(error, "Pid ~p timed out after ~p milliseconds", [Pid, Timeout]),
+                    {failed, timeout, State};
+                true ->
+                    ?log(info, "We exited cleanly but timed out... *NOT* treating as a failure.", []),
+                    {ok, timeout, State}
+            end;
         Msg ->
             ?log(warning, "Some rando message just showed up! ~p Ignoring.", [Msg]),
-            loop(Mref, Pid, Timeout, State, NormalExitRcvd)
-   after Timeout ->
-        case NormalExitRcvd of
-            false ->
-                ?log(error, "Pid ~p timed out after ~p milliseconds", [Pid, Timeout]),
-                {failed, timeout, State};
-            true ->
-                ?log(info, "We exited cleanly but timed out... *NOT* treating as a failure.", []),
-                {ok, timeout, State}
-        end
+            loop(Mref, Pid, TRef, State, NormalExitRcvd)
    end.
 
 make_closure(#operation{ f = {M, F, A}, timeout = T }, ReplyPid, State) ->
@@ -270,6 +272,7 @@ remove_meta(K, State) ->
     lists:keydelete(K, 1, State).
 
 validate_steps(Steps) when is_list(Steps) ->
+    %% todo check steps names are unique
     lists:all(fun validate_step/1, Steps);
 validate_steps(_) -> false.
 
@@ -283,10 +286,16 @@ validate_operation_fun( #operation{ f = F, timeout = T } ) ->
     validate_function(F) andalso is_integer(T) andalso T >= 0;
 validate_operation_fun(_) -> false.
 
-validate_function({F, A}) when is_function(F) andalso is_list(A) -> true;
+validate_function({F, A}) when is_list(A) -> true andalso is_function(F, length(A) + 1);
 validate_function({M, F, A}) when is_atom(M)
                                   andalso is_atom(F)
-                                  andalso is_list(A) -> true;
+                                  andalso is_list(A) ->
+    case code:ensure_loaded(M) of
+        {module, M} ->
+            erlang:function_exported(M, F, length(A) + 1);
+        _ ->
+            false
+    end;
 validate_function(_) -> false.
 
 is_valid_name(N) ->
@@ -314,12 +323,15 @@ validate_function_test_() ->
     [
       ?_assert(validate_function({fun() -> ok end, []})),
       ?_assert(validate_function({?MODULE, test_function, [test]})),
-      ?_assert(validate_function({F, []})),
       ?_assert(validate_function({F, [foo]})),
       ?_assertEqual(false, validate_function(<<"function">>)),
       ?_assertEqual(false, validate_function(decepticons)),
       ?_assertEqual(false, validate_function("function")),
-      ?_assertEqual(false, validate_function(42))
+      ?_assertEqual(false, validate_function(42)),
+      ?_assertEqual(false, validate_function({F, []})),
+      ?_assertEqual(false, validate_function({F, [foo, bar]})),
+      ?_assertEqual(false, validate_function({?MODULE, test_function, [test1, test2]})),
+      ?_assertEqual(false, validate_function({fake_module, test_function, [test]}))
     ].
 
 new_operation_test_() ->
